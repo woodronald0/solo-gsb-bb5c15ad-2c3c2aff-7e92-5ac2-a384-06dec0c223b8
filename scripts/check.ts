@@ -26,6 +26,7 @@ import {
   analyzeIssueBaseline,
   diffIssueBaseline,
 } from '../src/lib/issueBaseline';
+import { computeImpact } from '../src/lib/impact';
 import { assert } from 'node:console';
 
 let pass = 0;
@@ -1293,6 +1294,93 @@ check('闭区间为每个目标建边', combA.edges.filter((e) => e.refKey === r
   store2.importJson(exported);
   check('导入 JSON 恢复基线', store2.getSnapshot().issueBaselines.length === 1 && store2.getSnapshot().issueBaselines[0].name === '导出基线');
   check('导入基线可重新分析比较', diffIssueBaseline(analyzeIssueBaseline(store2.getSnapshot().issueBaselines[0]), store2.getSnapshot().analysis).counts.persisting >= 1);
+}
+
+// ---- 引用影响分析：直接 / 间接引用源条款分层 + 循环去重标注 ----
+{
+  // 图：一 → 二 → 三；一 → 三（第三条有两条路径可达，最短距离应为 1）；四 → 一；五孤立
+  // 另：三 → 二 与 二 → 三 构成二↔三循环
+  const impDoc = parseDocument(`影响办法
+
+第一条
+引用第二条和第三条。
+
+第二条
+本条依第三条执行。
+
+第三条
+适用第二条的规定。
+
+第四条
+依照第一条处理。
+
+第五条
+与其他条无关。`).doc;
+  const impA = analyze(impDoc, { confirmed: {} });
+  const A1 = impDoc.root[0].id;
+  const A2 = impDoc.root[1].id;
+  const A3 = impDoc.root[2].id;
+  const A4 = impDoc.root[3].id;
+  const A5 = impDoc.root[4].id;
+
+  const onThree = computeImpact(impA, A3);
+  check('影响分析：目标自身距离为 0', onThree?.distances.get(A3) === 0);
+  check('影响分析：第一层为直接引用（一、二）',
+    onThree?.layers[0].distance === 1 &&
+      onThree.layers[0].sources.map((s) => s.articleId).sort().join() === [A1, A2].sort().join(),
+    JSON.stringify(onThree?.layers));
+  check('影响分析：一到三有两条路径仍只出现一次（循环路径去重）',
+    onThree?.layers.reduce((n, l) => n + l.sources.filter((s) => s.articleId === A1).length, 0) === 1);
+  check('影响分析：第四条为第二层（间接引用）',
+    onThree?.layers[1]?.distance === 2 &&
+      onThree.layers[1].sources.some((s) => s.articleId === A4));
+  check('影响分析：孤立条不计入', onThree?.total === 3 && !onThree.distances.has(A5));
+  check('影响分析：各层数量统计', onThree?.layers[0].sources.length === 2 && onThree.layers[1].sources.length === 1);
+  check('影响分析：二、三互为循环 → 二标注 inCycle',
+    onThree?.layers[0].sources.find((s) => s.articleId === A2)?.inCycle === true);
+  check('影响分析：一不在二/三循环中 → 不标注',
+    onThree?.layers[0].sources.find((s) => s.articleId === A1)?.inCycle === false);
+  check('影响分析：viaEdge 指向更靠近目标一层（二→三）',
+    onThree?.layers[0].sources.find((s) => s.articleId === A2)?.viaEdge.to === A3);
+  check('影响分析：第四层链路 viaEdge 为 四→一',
+    onThree?.layers[1].sources.find((s) => s.articleId === A4)?.viaEdge.from === A4 &&
+      onThree.layers[1].sources.find((s) => s.articleId === A4)?.viaEdge.to === A1);
+
+  // 以第五条（无人引用）为目标
+  const onFive = computeImpact(impA, A5);
+  check('影响分析：无源条款时层数为 0', onFive?.total === 0 && onFive.layers.length === 0);
+
+  // 目标条在循环内部：以第二条为目标，三与二互指，三距离 1 且标注循环
+  const onTwo = computeImpact(impA, A2);
+  check('影响分析：循环内目标 → 三为第一层且标注循环',
+    onTwo?.layers[0].sources.some((s) => s.articleId === A3 && s.inCycle));
+  check('影响分析：循环内目标 → 一经 一→二 也为第一层',
+    onTwo?.layers[0].sources.some((s) => s.articleId === A1 && !s.inCycle));
+
+  // 不存在的目标
+  check('影响分析：目标不存在返回 null', computeImpact(impA, 'art-missing') === null);
+
+  // 同条对多条引用：边去重
+  const dupDoc = parseDocument(`第一条
+参见第二条；另见第二条。
+
+第二条
+内容。`).doc;
+  const dupA = analyze(dupDoc, { confirmed: {} });
+  const dupImpact = computeImpact(dupA, dupDoc.root[1].id);
+  check('影响分析：同条对去重为一条边', dupImpact?.edges.length === 1, String(dupImpact?.edges.length));
+  check('影响分析：第一层仅一个源条', dupImpact?.layers[0].sources.length === 1);
+  check('影响分析：viaEdge 携带 refKey 可跳回正文',
+    Boolean(dupImpact?.layers[0].sources[0].viaEdge.refKey) &&
+      dupA.occurrences.some((o) => o.key === dupImpact!.layers[0].sources[0].viaEdge.refKey));
+
+  // 条内相对自指（本条/前款）不作为影响边
+  const relDoc = parseDocument(`第一条
+本条第二款另有规定。
+前款内容。`).doc;
+  const relA = analyze(relDoc, { confirmed: {} });
+  const relImpact = computeImpact(relA, relDoc.root[0].id);
+  check('影响分析：条内相对自指不产生自环边', relImpact?.edges.length === 0);
 }
 
 console.log(`\n通过 ${pass} 项，失败 ${fail} 项`);
