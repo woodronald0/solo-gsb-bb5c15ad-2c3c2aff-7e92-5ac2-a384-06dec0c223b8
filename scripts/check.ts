@@ -26,6 +26,7 @@ import {
   analyzeIssueBaseline,
   diffIssueBaseline,
 } from '../src/lib/issueBaseline';
+import { computeImpact } from '../src/lib/impact';
 import { assert } from 'node:console';
 
 let pass = 0;
@@ -1293,6 +1294,147 @@ check('闭区间为每个目标建边', combA.edges.filter((e) => e.refKey === r
   store2.importJson(exported);
   check('导入 JSON 恢复基线', store2.getSnapshot().issueBaselines.length === 1 && store2.getSnapshot().issueBaselines[0].name === '导出基线');
   check('导入基线可重新分析比较', diffIssueBaseline(analyzeIssueBaseline(store2.getSnapshot().issueBaselines[0]), store2.getSnapshot().analysis).counts.persisting >= 1);
+}
+
+// ---- 引用影响分析：直接 / 间接引用分层、循环去重与标注 ----
+{
+  // 链式：一→二→三（第一条引用第二条，第二条引用第三条）
+  const chainDoc = parseDocument(`影响法
+
+第一条
+参见第二条。
+
+第二条
+参见第三条。
+
+第三条
+内容。`).doc;
+  renumberAll(chainDoc.root);
+  const chainA = analyze(chainDoc, { confirmed: {} });
+  const impact3 = computeImpact(chainA, chainDoc.root[2].id);
+  check('影响分析：直接引用层 1 个', impact3.layers[0]?.entries.length === 1 && impact3.layers[0].entries[0].articleId === chainDoc.root[1].id);
+  check('影响分析：间接引用层为第一条', impact3.layers[1]?.entries[0]?.articleId === chainDoc.root[0].id);
+  check('影响分析：距离分层 1/2', impact3.layers[0].entries[0].distance === 1 && impact3.layers[1].entries[0].distance === 2);
+  check('影响分析：总数不含目标本身', impact3.total === 2, String(impact3.total));
+  check('影响分析：无循环时不标注', impact3.cycleCount === 0 && !impact3.targetInCycle && impact3.dedupedPaths === 0);
+
+  // 无引用者
+  const impact1 = computeImpact(chainA, chainDoc.root[0].id);
+  check('影响分析：无人引用时为空', impact1.total === 0 && impact1.layers.length === 0);
+
+  // 汇聚（菱形）：四同时引用二、三；二、三都引用一 → 四只列一次且按最短距离
+  const diamondDoc = parseDocument(`汇聚法
+
+第一条
+目标。
+
+第二条
+参见第一条。
+
+第三条
+参见第一条。
+
+第四条
+参见第二条和第三条。`).doc;
+  renumberAll(diamondDoc.root);
+  const diamondA = analyze(diamondDoc, { confirmed: {} });
+  const impactD = computeImpact(diamondA, diamondDoc.root[0].id);
+  check('影响分析：汇聚路径去重（四只出现一次）', impactD.total === 3, String(impactD.total));
+  check('影响分析：第一层按文档顺序', impactD.layers[0].entries.map((e) => e.articleId).join(',') === [diamondDoc.root[1].id, diamondDoc.root[2].id].join(','));
+  check('影响分析：重复路径计数', impactD.dedupedPaths === 1, String(impactD.dedupedPaths));
+
+  // 最短距离优先：三同时直接引用一、经二间接引用一 → 三在第 1 层
+  const nearDoc = parseDocument(`短距法
+
+第一条
+目标。
+
+第二条
+参见第一条。
+
+第三条
+参见第一条和第二条。`).doc;
+  renumberAll(nearDoc.root);
+  const nearA = analyze(nearDoc, { confirmed: {} });
+  const impactN = computeImpact(nearA, nearDoc.root[0].id);
+  check(
+    '影响分析：多条路径按最短距离分层',
+    impactN.layers.length === 1 && impactN.layers[0].entries.length === 2,
+    JSON.stringify(impactN.layers.map((l) => l.entries.length)),
+  );
+
+  // 循环：一↔二 互引 → 去重并标注
+  const cycDoc = parseDocument(`循环影响法
+
+第一条
+参见第二条。
+
+第二条
+参见第一条。`).doc;
+  renumberAll(cycDoc.root);
+  const cycA = analyze(cycDoc, { confirmed: {} });
+  const impactC = computeImpact(cycA, cycDoc.root[0].id);
+  check('影响分析：循环中目标不重复列入自身结果', impactC.total === 1 && impactC.layers[0].entries[0].articleId === cycDoc.root[1].id);
+  check('影响分析：循环路径去重计数', impactC.dedupedPaths === 1, String(impactC.dedupedPaths));
+  check('影响分析：循环条款标注', impactC.layers[0].entries[0].inCycle === true);
+  check('影响分析：目标处于循环中', impactC.targetInCycle === true && impactC.cycleCount === 1);
+
+  // 三环：一→二→三→一，分析一时 三在第 1 层、二在第 2 层，全部标注循环
+  const triDoc = parseDocument(`三环法
+
+第一条
+参见第二条。
+
+第二条
+参见第三条。
+
+第三条
+参见第一条。`).doc;
+  renumberAll(triDoc.root);
+  const triA = analyze(triDoc, { confirmed: {} });
+  const impactT = computeImpact(triA, triDoc.root[0].id);
+  check(
+    '影响分析：三环分层正确',
+    impactT.layers[0]?.entries[0]?.articleId === triDoc.root[2].id &&
+      impactT.layers[1]?.entries[0]?.articleId === triDoc.root[1].id,
+    JSON.stringify(impactT.layers.map((l) => l.entries.map((e) => e.articleId))),
+  );
+  check('影响分析：三环全部标注', impactT.cycleCount === 2 && impactT.layers.every((l) => l.entries.every((e) => e.inCycle)));
+
+  // 条内绝对自指不构成条款间影响路径
+  const selfDoc2 = parseDocument(`自指影响法
+
+第五条
+按第五条执行。
+
+第六条
+参见第五条。`).doc;
+  selfDoc2.root[0].ordinal = 5;
+  selfDoc2.root[1].ordinal = 6;
+  const selfA2 = analyze(selfDoc2, { confirmed: {} });
+  const impactS = computeImpact(selfA2, selfDoc2.root[0].id);
+  check('影响分析：条内自指不计入影响路径', impactS.total === 1 && impactS.layers[0].entries[0].articleId === selfDoc2.root[1].id, String(impactS.total));
+
+  // 基于确认后的解析图：歧义引用确认后才计入影响
+  const ambDoc2 = parseDocument(`确认影响法
+
+第八条
+参见第八条。
+
+第八条之一
+补充规定。`).doc;
+  ambDoc2.root[1].suffix = '一';
+  const ambNoConf = analyze(ambDoc2, { confirmed: {} });
+  const ambOcc = ambNoConf.occurrences.find((o) => o.resolution.status === 'ambiguous')!;
+  check('影响分析：未确认的歧义引用不计入', computeImpact(ambNoConf, ambDoc2.root[1].id).total === 0);
+  const ambConf = analyze(ambDoc2, { confirmed: { [ambOcc.signature]: ambDoc2.root[1].id } });
+  const impactAmb = computeImpact(ambConf, ambDoc2.root[1].id);
+  check('影响分析：确认后的引用计入影响', impactAmb.total === 1 && impactAmb.layers[0].entries[0].articleId === ambDoc2.root[0].id);
+
+  // 纯计算：不改动分析结果（会话内只读）
+  const beforeJson = JSON.stringify(chainA);
+  computeImpact(chainA, chainDoc.root[2].id);
+  check('影响分析：计算不修改解析图', JSON.stringify(chainA) === beforeJson);
 }
 
 console.log(`\n通过 ${pass} 项，失败 ${fail} 项`);

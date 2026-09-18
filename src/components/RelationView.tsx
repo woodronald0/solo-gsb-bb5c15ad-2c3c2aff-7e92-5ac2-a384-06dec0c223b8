@@ -3,6 +3,7 @@ import { useApp } from '../lib/context';
 import { useHighlighter } from '../lib/highlighter';
 import { shortArticleLabel } from '../lib/labels';
 import { formatOrdinal } from '../lib/numeral';
+import { computeImpact, type ImpactReport } from '../lib/impact';
 
 const W = 520;
 const H = 560;
@@ -12,7 +13,38 @@ export function RelationView() {
   const [, force] = useState(0);
   useEffect(() => store.subscribe(() => force((n) => n + 1)), [store]);
   const hl = useHighlighter(highlighter);
-  const { analysis } = store.getSnapshot();
+  const { analysis, doc } = store.getSnapshot();
+
+  // 引用影响分析：会话内临时状态（不持久化、不修改正文、不进入撤销历史）
+  const [targetId, setTargetId] = useState<string | null>(null);
+  const [report, setReport] = useState<{ data: ImpactReport; updatedAt: number } | null>(null);
+
+  const selectTarget = (id: string | null) => {
+    setTargetId(id);
+    if (!id) {
+      setReport(null);
+      return;
+    }
+    setReport({ data: computeImpact(analysis, id), updatedAt: doc.updatedAt });
+  };
+
+  const refreshReport = () => {
+    if (!targetId) return;
+    if (!analysis.nodes[targetId]) {
+      // 目标条款已删除：结果失效，等待用户重新选择或清空
+      setReport(null);
+      return;
+    }
+    setReport({ data: computeImpact(analysis, targetId), updatedAt: doc.updatedAt });
+  };
+
+  const clearSelection = () => {
+    setTargetId(null);
+    setReport(null);
+  };
+
+  const targetGone = Boolean(targetId && !analysis.nodes[targetId!]);
+  const stale = Boolean(report && report.updatedAt !== doc.updatedAt);
 
   const positions = useMemo(() => {
     const n = analysis.articles.length;
@@ -158,11 +190,16 @@ export function RelationView() {
             return (
               <g
                 key={a.id}
-                className={`graph-node ${cls} ${activeArticle === a.id ? 'active' : ''}`}
+                className={`graph-node ${cls} ${activeArticle === a.id ? 'active' : ''} ${targetId === a.id ? 'impact-target' : ''}`}
                 transform={`translate(${p.x}, ${p.y})`}
                 onMouseEnter={() => highlighter.activateNode(a.id)}
                 onMouseLeave={() => highlighter.activateNode('')}
-                onClick={() => highlighter.jumpTo(a.id)}              >
+                onClick={() => {
+                  // 点击节点：选为引用影响分析目标，并定位到正文该条
+                  selectTarget(a.id);
+                  highlighter.jumpTo(a.id);
+                }}
+              >
                 <circle r={20} />
                 <text textAnchor="middle" dy="4" className="graph-node-text">
                   {formatOrdinal(a.ordinal)}
@@ -176,8 +213,123 @@ export function RelationView() {
         </svg>
       )}
 
+      {analysis.articles.length > 0 && (
+        <div className="impact-panel">
+          <div className="impact-head">
+            <span className="impact-title">引用影响分析</span>
+            <select
+              className="impact-select"
+              value={targetId ?? ''}
+              onChange={(e) => selectTarget(e.target.value || null)}
+              aria-label="选择影响分析目标条款"
+            >
+              <option value="">选择条款…</option>
+              {analysis.articles.map((a) => (
+                <option key={a.id} value={a.id}>
+                  {shortArticleLabel(a.ordinal, a.suffix)}
+                  {a.title ? ` ${a.title}` : ''}
+                </option>
+              ))}
+              {targetGone && targetId && (
+                <option value={targetId}>（已删除的条款）</option>
+              )}
+            </select>
+            <button className="small" onClick={refreshReport} disabled={!targetId || targetGone}>
+              刷新
+            </button>
+            <button className="small" onClick={clearSelection} disabled={!targetId && !report}>
+              清空选择
+            </button>
+          </div>
+
+          {!targetId && (
+            <div className="impact-hint">
+              点击图中节点或从下拉框选择条款，分析哪些条款直接 / 间接引用了它。
+            </div>
+          )}
+
+          {targetGone && (
+            <div className="impact-stale">目标条款已被删除，分析结果失效，请重新选择或清空。</div>
+          )}
+
+          {stale && !targetGone && (
+            <div className="impact-stale">
+              正文已变更，以下结果基于旧解析图。
+              <button className="link-btn" onClick={refreshReport}>
+                立即刷新
+              </button>
+            </div>
+          )}
+
+          {report && !targetGone && (
+            <div className="impact-result">
+              <div className="impact-summary">
+                共 <strong>{report.data.total}</strong> 个条款引用
+                「{shortArticleLabel(
+                  analysis.nodes[report.data.targetId]?.ordinal ?? 0,
+                  analysis.nodes[report.data.targetId]?.suffix,
+                )}」（{report.data.layers.length} 层）
+                {report.data.cycleCount > 0 && (
+                  <span className="impact-cycle-note"> · {report.data.cycleCount} 个处于循环</span>
+                )}
+              </div>
+
+              {report.data.targetInCycle && (
+                <div className="impact-cycle-line">
+                  ↻ 目标条款处于引用循环中，循环路径上的条款已标注。
+                </div>
+              )}
+
+              {report.data.total === 0 && (
+                <div className="impact-hint">没有条款引用该条款。</div>
+              )}
+
+              {report.data.layers.map((layer) => (
+                <div className="impact-layer" key={layer.distance}>
+                  <div className="impact-layer-head">
+                    第{formatOrdinal(layer.distance)}层 ·{' '}
+                    {layer.distance === 1 ? '直接引用' : '间接引用'}（{layer.entries.length} 条）
+                  </div>
+                  {layer.entries.map((entry) => {
+                    const node = analysis.nodes[entry.articleId];
+                    return (
+                      <button
+                        key={entry.articleId}
+                        className="impact-row"
+                        disabled={!node}
+                        onClick={() => highlighter.jumpTo(entry.articleId)}
+                        onMouseEnter={() => highlighter.activateNode(entry.articleId)}
+                        onMouseLeave={() => highlighter.activateNode('')}
+                        title={node ? '点击跳回正文该条' : '该条款已删除'}
+                      >
+                        <span className="impact-row-label">
+                          {node
+                            ? shortArticleLabel(node.ordinal, node.suffix)
+                            : '（已删除）'}
+                        </span>
+                        {node?.title && <span className="impact-row-title">{node.title}</span>}
+                        {entry.inCycle && <span className="impact-cycle-badge">↻ 循环</span>}
+                      </button>
+                    );
+                  })}
+                </div>
+              ))}
+
+              <div className="impact-note">
+                基于当前确认后的解析图，结果仅用于当前会话，不修改正文、不写入撤销历史；
+                同一条款只按最短距离列出一次
+                {report.data.dedupedPaths > 0
+                  ? `（已去重 ${report.data.dedupedPaths} 条重复 / 循环路径）`
+                  : ''}
+                。
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
       <div className="panel-footer">
-        悬停节点可定位正文条目；悬停或点击边可跳转到产生引用的源句。
+        悬停节点可定位正文条目；点击节点选为影响分析目标并定位正文；悬停或点击边可跳转到产生引用的源句。
       </div>
     </div>
   );
